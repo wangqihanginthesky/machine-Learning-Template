@@ -4,7 +4,9 @@ import joblib
 import numpy as np
 from sklearn.model_selection import KFold
 import mlflow
+import optuna.integration.lightgbm as lgb_o
 from .loss import rmspe,feval_rmspe,rmse
+from datetime import datetime
 seed=2022
 
 class LightGBM:
@@ -30,7 +32,7 @@ class LightGBM:
         self.target_feature=target_feature
         self.features=list(rawdata.columns.drop(self.target_feature))
         self.data=rawdata
-        self.params = {
+        self.params ={
                     'learning_rate': 0.1,        
                     'lambda_l1': 1,
                     'lambda_l2': 1,
@@ -51,7 +53,7 @@ class LightGBM:
                     'boosting': 'gbdt',
                     'verbosity': -1,
                     'n_jobs': -1,
-                }   
+                }
 
     def _featuresEngineering(self):
         """You need to custmize this by your self.
@@ -64,12 +66,38 @@ class LightGBM:
         
 
     def _tunning(self,kfold_n=5):
-        pass
-    
+        params = {'objective': 'regression',
+          'metric': 'rmse',
+          'random_seed':seed}
+        best_params=[] 
+        
+        self._featuresEngineering()
+        x = self.data.drop([self.target_feature], axis = 1)
+        y = self.data[self.target_feature]
+        # Create a KFold object
+        kfold = KFold(n_splits = kfold_n, random_state = 66, shuffle = True)
+        # Train
+        for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
+            print(f'Training fold {fold + 1}')
+            x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
+            y_train, y_val = y.iloc[trn_ind], y.iloc[val_ind]
+            train_dataset = lgb_o.Dataset(x_train, y_train)
+            val_dataset = lgb_o.Dataset(x_val, y_val)
+            
+            locals()["gbm_o%s"%fold] =lgb_o.train(params = params, 
+                            train_set = train_dataset, 
+                            valid_sets = [train_dataset, val_dataset],
+                            early_stopping_rounds=400,
+                            verbose_eval=-1)
+            best_params.append(locals()["gbm_o%s"%fold].params)
+        return best_params
+
     def _featureSelection(self,model,features):
         pass
 
-    def _train(self,kfold_n):
+    def _train(self,kfold_n,discription):
+        mlflow.lightgbm.autolog()
+        mlflow.set_tag('mlflow.note.content', discription)
         model_list=[]
         self._featuresEngineering()
         x = self.data.drop([self.target_feature], axis = 1)
@@ -78,28 +106,45 @@ class LightGBM:
         # Create a KFold object
         kfold = KFold(n_splits = kfold_n, random_state = 66, shuffle = True)
         # Train
-        with mlflow.start_run():
-            for key in self.params:
-                mlflow.log_param(key, self.params[key])
+        mlflow.end_run()
+        with mlflow.start_run(run_name="lightGBM"):
+            if type(self.params) is list:
+                pass
+            else:
+                for key in self.params:
+                    mlflow.log_param(key, self.params[key])
+
             for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
                 print(f'Training fold {fold + 1}')
                 x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
                 y_train, y_val = y.iloc[trn_ind], y.iloc[val_ind]
                 train_dataset = lgb.Dataset(x_train, y_train)
                 val_dataset = lgb.Dataset(x_val, y_val)
-                locals()["models_%s"%fold] = lgb.train(params = self.params, 
-                                train_set = train_dataset, 
-                                valid_sets = [train_dataset, val_dataset])
-                model_list.append(locals()["models_%s"%fold])
-                joblib.dump(locals()["models_%s"%fold], 'regression/lightgbm/models/model_%s.pkl'%fold)
+                if type(self.params) is list:
+                    model_tmp=lgb.train(params = self.params[fold], 
+                                    train_set = train_dataset, 
+                                    valid_sets = [train_dataset, val_dataset],
+                                    early_stopping_rounds=400,
+                                    verbose_eval=-1,
+                                    )
+                else:
+                    model_tmp=lgb.train(params = self.params, 
+                                    train_set = train_dataset, 
+                                    valid_sets = [train_dataset, val_dataset],
+                                    early_stopping_rounds=400,
+                                    verbose_eval=-1,
+                                    )
+                model_list.append(model_tmp)
+                joblib.dump(model_tmp, 'regression/lightgbm/models/model_%s.pkl'%fold)
                 
                 # Add predictions to the out of folds array
-                oof_predictions[val_ind] = locals()["models_%s"%fold].predict(x_val)
+                oof_predictions[val_ind] = model_tmp.predict(x_val)
             rmspe_score=rmspe(y, oof_predictions)
             rmse_score=rmse(y, oof_predictions)
-
+            print(f"rmpse is {rmspe_score} , rmse is {rmse_score}")
             mlflow.log_metric("mean rmse", rmspe_score)
             mlflow.log_metric("mean rmspe_score", np.mean(rmse_score))
+            mlflow.end_run()
             
         
             
